@@ -237,6 +237,10 @@
     self._urls = o.urls || [];
     self._rate = o.rate || 1;
 
+    //added by Yipeng
+    self._requireWXValidation = o.requireWXValidation || false;
+    self._initialAudioCount = o.initlaAudioCount || 5;
+
     // allow forcing of a specific panningModel ('equalpower' or 'HRTF'),
     // if none is specified, defaults to 'equalpower' and switches to 'HRTF'
     // if 3d sound is used
@@ -278,7 +282,7 @@
      * Load an audio file.
      * @return {Howl}
      */
-    load: function() {
+    load: function(callback) {
       var self = this,
         url = null;
 
@@ -327,50 +331,71 @@
       if (self._webAudio) {
         loadBuffer(self, url);
       } else {
-        var newNode = new Audio();
+          for (var i = 0; i < self._initialAudioCount; i++) {
+              self._audioNode.push(new Audio());
+              var newNode = self._audioNode[i];
 
-        // listen for errors with HTML5 audio (http://dev.w3.org/html5/spec-author-view/spec.html#mediaerror)
-        newNode.addEventListener('error', function () {
-          if (newNode.error && newNode.error.code === 4) {
-            HowlerGlobal.noAudio = true;
+              (function(newNode, i) {
+                  newNode.addEventListener('error', function() {
+                      if (newNode.error && newNode.error.code === 4) {
+                          HowlerGlobal.noAudio = true;
+                      }
+
+                      self.on('loaderror', {
+                          type: newNode.error ? newNode.error.code : 0
+                      });
+                  }, false);
+
+                  //self._audioNode.push(newNode);
+
+                  // setup the new audio node
+                  newNode.src = url;
+                  newNode._pos = 0;
+                  newNode.preload = 'auto';
+                  newNode.volume = (Howler._muted) ? 0 : self._volume * Howler.volume();
+
+                  // setup the event listener to start playing the sound
+                  // as soon as it has buffered enough
+                  var listener = function() {
+                      // round up the duration when using HTML5 Audio to account for the lower precision
+                      if (newNode.duration > 0) {
+                          newNode.pause();
+                          self._duration = Math.ceil(newNode.duration * 10) / 10;
+
+                          // setup a sprite if none is defined
+                          if (Object.getOwnPropertyNames(self._sprite).length === 0) {
+                              self._sprite = {
+                                  _default: [0, self._duration * 1000]
+                              };
+                          }
+
+                          if (!self._loaded) {
+                              self._loaded = true;
+                              self.on('load');
+                          }
+
+                          if (self._autoplay) {
+                              self.play();
+                          }
+
+                          // clear the event listener
+                          newNode.removeEventListener('timeupdate', listener, false);
+                      }
+                  };
+
+                  newNode.addEventListener('timeupdate', listener, false);
+                  if (wx && self._requireWXValidation) {
+                      wx.checkJsApi({
+                          complete: function() {
+                              newNode.play();
+                          }
+                      })
+                  } else {
+                      newNode.play();
+                  }
+
+              }(newNode, i))
           }
-
-          self.on('loaderror', {type: newNode.error ? newNode.error.code : 0});
-        }, false);
-
-        self._audioNode.push(newNode);
-
-        // setup the new audio node
-        newNode.src = url;
-        newNode._pos = 0;
-        newNode.preload = 'auto';
-        newNode.volume = (Howler._muted) ? 0 : self._volume * Howler.volume();
-
-        // setup the event listener to start playing the sound
-        // as soon as it has buffered enough
-        var listener = function() {
-          // round up the duration when using HTML5 Audio to account for the lower precision
-          self._duration = Math.ceil(newNode.duration * 10) / 10;
-
-          // setup a sprite if none is defined
-          if (Object.getOwnPropertyNames(self._sprite).length === 0) {
-            self._sprite = {_default: [0, self._duration * 1000]};
-          }
-
-          if (!self._loaded) {
-            self._loaded = true;
-            self.on('load');
-          }
-
-          if (self._autoplay) {
-            self.play();
-          }
-
-          // clear the event listener
-          newNode.removeEventListener('canplaythrough', listener, false);
-        };
-        newNode.addEventListener('canplaythrough', listener, false);
-        newNode.load();
       }
 
       return self;
@@ -432,6 +457,8 @@
 
       // get the node to playback
       self._inactiveNode(function(node) {
+node._activated = true;
+
         // persist the sprite being played
         node._sprite = sprite;
 
@@ -462,6 +489,7 @@
             loop: loop
           };
           timerId = setTimeout(function() {
+              self._nodeById(data.id)._activated = false;
             // if looping, restart the track
             if (!self._webAudio && loop) {
               self.stop(data.id).play(sprite, data.id);
@@ -567,6 +595,7 @@
       var activeNode = (id) ? self._nodeById(id) : self._activeNode();
       if (activeNode) {
         activeNode._pos = self.pos(null, id);
+        activeNode._activated = false;
 
         if (self._webAudio) {
           // make sure the sound has been created
@@ -613,6 +642,7 @@
       var activeNode = (id) ? self._nodeById(id) : self._activeNode();
       if (activeNode) {
         activeNode._pos = 0;
+        activeNode._activated = false;
 
         if (self._webAudio) {
           // make sure the sound has been created
@@ -987,7 +1017,7 @@
 
       // find first inactive node to recycle
       for (var i=0; i<self._audioNode.length; i++) {
-        if (self._audioNode[i].paused && self._audioNode[i].readyState === 4) {
+        if (self._audioNode[i].paused && !self._audioNode[i]._activated && self._audioNode[i].readyState === 4) {
           // send the node back for use by the new play instance
           callback(self._audioNode[i]);
           node = true;
@@ -1008,16 +1038,19 @@
         newNode = self._setupAudioNode();
         callback(newNode);
       } else {
-        self.load();
-        newNode = self._audioNode[self._audioNode.length - 1];
+        self.load(function(){
+            newNode = self._audioNode[self._audioNode.length - 1];
+            callback(newNode);
+        });
+
 
         // listen for the correct load event and fire the callback
-        var listenerEvent = navigator.isCocoonJS ? 'canplaythrough' : 'loadedmetadata';
-        var listener = function() {
-          newNode.removeEventListener(listenerEvent, listener, false);
-          callback(newNode);
-        };
-        newNode.addEventListener(listenerEvent, listener, false);
+        // var listenerEvent = navigator.isCocoonJS ? 'canplaythrough' : 'loadedmetadata';
+        // var listener = function() {
+        //   newNode.removeEventListener(listenerEvent, listener, false);
+        //   callback(newNode);
+        // };
+        // newNode.addEventListener(listenerEvent, listener, false);
       }
     },
 
@@ -1214,7 +1247,7 @@
         loadSound(obj);
         return;
       }
-      
+
       if (/^data:[^;]+;base64,/.test(url)) {
         // Decode base64 data-URIs because some browsers cannot load data-URIs with XMLHttpRequest.
         var data = atob(url.split(',')[1]);
@@ -1222,7 +1255,7 @@
         for (var i=0; i<data.length; ++i) {
           dataView[i] = data.charCodeAt(i);
         }
-        
+
         decodeAudioData(dataView.buffer, obj, url);
       } else {
         // load the buffer from the URL
